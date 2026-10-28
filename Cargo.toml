@@ -1,0 +1,34 @@
+[package]
+name = "secure_memory"
+version = "0.1.0"
+edition = "2021"
+description = "Locked, zeroize-on-drop memory buffer exposed to Python via PyO3"
+license = "Apache 2.0"
+rust-version = "1.83"
+
+[lib]
+name = "secure_memory"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.29" }
+zeroize  = { version = "1.7",  features = ["derive", "alloc"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
+[dev-dependencies]
+tempfile = "3"
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo" 
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "secure_memory"
+version = "0.1.0"
+description = "Locked, zeroize-on-drop memory buffer for Python, backed by a Rust/PyO3 extension"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
