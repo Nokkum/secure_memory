@@ -1,0 +1,108 @@
+name: Release Per Version Bump
+
+on:
+  workflow_run:
+    workflows: ["Secure Memory CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Detect version bump, tag, and release
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read project version
+        id: version
+        run: |
+          RAW_VERSION=$(awk '
+            /^\[/ { in_pkg = ($0 ~ /^\[package\]/) ; next }
+            in_pkg && /^version[[:space:]]*=/ {
+              match($0, /"[^"]+"/)
+              if (RSTART) {
+                print substr($0, RSTART+1, RLENGTH-2)
+                exit
+              }
+            }
+          ' Cargo.toml)
+
+          if [ -z "$RAW_VERSION" ]; then
+            echo "::error::Could not determine project version from Cargo.toml."
+            exit 1
+          fi
+
+          # Strip a leading v/V (if present) so we don't end up with "vv1.2.3"
+          VERSION="${RAW_VERSION#v}"
+          VERSION="${VERSION#V}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $RAW_VERSION (tag: v$VERSION)"
+
+      - name: Check if tag already exists
+        id: tag_check
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists — nothing to release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG does not exist — will create and release."
+          fi
+
+      - name: Create and push tag
+        if: steps.tag_check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Download wheels
+        if: steps.tag_check.outputs.exists == 'false'
+        uses: actions/download-artifact@v7
+        with:
+          pattern: secure_memory-*
+          merge-multiple: true
+          path: wheels/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List downloaded wheels
+        if: steps.tag_check.outputs.exists == 'false'
+        run: |
+          echo "Wheels downloaded:"
+          find wheels -type f -name '*.whl' -printf '%P\n' | sort
+
+      - name: Create Release
+        if: steps.tag_check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, '-') }}
+          files: |
+            wheels/**/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

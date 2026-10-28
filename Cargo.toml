@@ -1,6 +1,6 @@
 [package]
 name = "secure_memory"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Locked, zeroize-on-drop memory buffer exposed to Python via PyO3"
 license = "Apache 2.0"

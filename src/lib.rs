@@ -21,6 +21,13 @@ const LEAKED_VIEW_MSG: &str =
      (a slice or copy of the memoryview was kept)";
 
 // SecureMemory
+#[pymodule]
+fn secure_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<SecureMemory>()?;
+    m.add_class::<SecureView>()?;
+    Ok(())
+}
+
 #[pyclass]
 pub struct SecureMemory {
     /// Fixed-size backing store.  It must never be resized: exported buffer
