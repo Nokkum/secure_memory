@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  rust-core:
+  secure-memory:
     runs-on: ubuntu-24.04
 
     steps:
@@ -37,7 +37,7 @@ jobs:
       - name: Lint with Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build rust_core
+      - name: Build secure_memory
         run: cargo build --all-targets
 
       - name: Run tests
