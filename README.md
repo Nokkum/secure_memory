@@ -1,4 +1,4 @@
-<h1 align="center"> `secure_memory` </h1>
+<h1 align="center">Secure Memory</h1>
 <p align="center">
 
 `secure_memory` is a Python extension implemented in Rust that provides a fixed-size memory buffer intended for temporarily storing sensitive byte data.
