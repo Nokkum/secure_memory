@@ -20,6 +20,10 @@ const LEAKED_VIEW_MSG: &str =
     "a view of the secure buffer is still alive after the access scope ended \
      (a slice or copy of the memoryview was kept)";
 
+const WRITE_WHILE_VIEWED_MSG: &str =
+    "cannot write to the secure buffer while a view of it is alive \
+     (release the memoryview, and any slice or copy of it, first)";
+
 // SecureMemory
 #[pymodule]
 fn secure_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -34,7 +38,9 @@ pub struct SecureMemory {
     /// views hold a raw pointer into it.
     data: Vec<u8>,
     locked: bool,
-    /// Number of live buffer-protocol exports over `data`.
+    /// Number of live buffer-protocol exports over `data`.  `write()` is
+    /// refused while this is non-zero, so a live view never observes a
+    /// partially written buffer.
     exports: AtomicUsize,
 }
 
@@ -53,7 +59,23 @@ impl SecureMemory {
     }
 
     // write / read
+
+    /// Copy `data` into the buffer at `offset`.
+    ///
+    /// Raises `BufferError` if any view of the buffer is still alive
+    /// (`memoryview(sm)`, `with_buffer()`, `view()`, or a slice kept from
+    /// one).  Views point straight at the backing store, and a consumer that
+    /// releases the GIL (hashing, socket/file I/O, free-threaded builds) could
+    /// otherwise read while this copy is in flight and see a torn mix of old
+    /// and new bytes.  Release the views first, then write.
+    ///
+    /// `&mut self` already serialises this against `read()`, `as_bytes()` and
+    /// new exports (PyO3's borrow flag), so checking `exports` here cannot
+    /// race with a view being created.
     fn write(&mut self, offset: usize, data: &[u8]) -> PyResult<()> {
+        if self.exports() != 0 {
+            return Err(PyBufferError::new_err(WRITE_WHILE_VIEWED_MSG));
+        }
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Offset overflow"))?;
@@ -87,6 +109,13 @@ impl SecureMemory {
     }
 
     /// Zeroize the buffer in place.  The length is unchanged.
+    ///
+    /// Unlike `write()`, this is never refused because of live views: a wipe
+    /// must always succeed, otherwise a leaked view (which also keeps the
+    /// object, and so `Drop`, alive) would make the secret impossible to
+    /// erase.  The wipe is visible through live views.  It only ever
+    /// writes zeros, so a reader racing with it can at worst see a partially
+    /// wiped buffer, never new or inconsistent plaintext.
     fn clear(&mut self) {
         // Zeroize the *slice*.  `Vec<u8>::zeroize()` also truncates the Vec
         // to length 0, which would shrink `len()`, make later writes fail and
@@ -154,7 +183,10 @@ impl SecureMemory {
     ///
     /// The exported view holds a strong reference to this object, so the
     /// memory cannot be freed (or zeroized by `Drop`) while a view exists.
-    /// `clear()` and `write()` remain visible through live views.
+    ///
+    /// While any view is alive the contents are stable: `write()` raises
+    /// `BufferError`.  `clear()` is the one exception (see its docs) and is
+    /// visible through live views.
     ///
     /// # Safety
     ///
@@ -176,7 +208,12 @@ impl SecureMemory {
         }
 
         let (buf, len) = {
-            let this = slf.borrow();
+            // `try_borrow`, not `borrow`: if `write()`/`clear()` holds the
+            // object right now (free-threaded builds), fail with a
+            // `BufferError` instead of panicking.
+            let this = slf.try_borrow().map_err(|_| {
+                PyBufferError::new_err("secure buffer is being modified; try again")
+            })?;
             this.exports.fetch_add(1, Ordering::AcqRel);
             (this.data.as_ptr() as *mut c_void, this.data.len())
         };
@@ -404,6 +441,70 @@ mod tests {
             // Zero-copy: clear() is visible through the live view.
             obj.borrow_mut().clear();
             assert_eq!(tobytes(&mv).unwrap(), vec![0u8; 8]);
+
+            mv.call_method0("release").unwrap();
+            drop(mv);
+            assert_eq!(obj.borrow().exports(), 0);
+        });
+    }
+
+    #[test]
+    fn test_write_refused_while_view_alive() {
+        Python::attach(|py| {
+            let obj = Bound::new(py, SecureMemory::new(8).unwrap()).unwrap();
+            obj.borrow_mut().write(0, b"original").unwrap();
+
+            let mv = SecureMemory::memoryview(&obj).unwrap();
+            assert_eq!(obj.borrow().exports(), 1);
+
+            let err = obj.borrow_mut().write(0, b"tampered").unwrap_err();
+            assert!(err.is_instance_of::<PyBufferError>(py));
+            assert_eq!(
+                tobytes(&mv).unwrap(),
+                b"original".to_vec(),
+                "a refused write must not touch the buffer"
+            );
+
+            mv.call_method0("release").unwrap();
+            drop(mv);
+            assert_eq!(obj.borrow().exports(), 0);
+
+            // Once the view is gone, writing works again.
+            obj.borrow_mut().write(0, b"tampered").unwrap();
+            assert_eq!(&obj.borrow().data[..], b"tampered");
+        });
+    }
+
+    #[test]
+    fn test_retained_view_keeps_write_refused() {
+        Python::attach(|py| {
+            let obj = Bound::new(py, SecureMemory::new(4).unwrap()).unwrap();
+            obj.borrow_mut().write(0, b"abcd").unwrap();
+
+            let mv = SecureMemory::memoryview(&obj).unwrap();
+            // A derived view survives `mv.release()`.
+            let derived = builtin(py, "memoryview").call1((&mv,)).unwrap();
+            mv.call_method0("release").unwrap();
+            assert_eq!(obj.borrow().exports(), 1);
+            assert!(obj.borrow_mut().write(0, b"wxyz").is_err());
+            assert_eq!(&obj.borrow().data[..], b"abcd");
+
+            drop(derived);
+            assert_eq!(obj.borrow().exports(), 0);
+            assert!(obj.borrow_mut().write(0, b"wxyz").is_ok());
+        });
+    }
+
+    #[test]
+    fn test_clear_still_works_with_live_view() {
+        Python::attach(|py| {
+            let obj = Bound::new(py, SecureMemory::new(4).unwrap()).unwrap();
+            obj.borrow_mut().write(0, b"abcd").unwrap();
+
+            let mv = SecureMemory::memoryview(&obj).unwrap();
+            // A wipe is never blocked by a (possibly leaked) view.
+            obj.borrow_mut().clear();
+            assert_eq!(tobytes(&mv).unwrap(), vec![0u8; 4]);
 
             mv.call_method0("release").unwrap();
             drop(mv);
