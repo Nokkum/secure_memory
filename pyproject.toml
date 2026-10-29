@@ -4,8 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "secure_memory"
-version = "0.2.1"
+version = "0.2.2"
 description = "Locked, zeroize-on-drop memory buffer for Python, backed by a Rust/PyO3 extension"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "Apache 2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Nokkum", email = "nokkum.github@gmail.com" }]
 requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Rust",
