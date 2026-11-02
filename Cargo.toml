@@ -1,6 +1,6 @@
 [package]
 name = "secure_memory"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Locked, zeroize-on-drop memory buffer exposed to Python via PyO3"
 license = "Apache 2.0"
@@ -25,9 +25,9 @@ pyo3 = { version = "0.29", features = ["auto-initialize"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
-strip = "debuginfo" 
+strip = "symbols" 
 
 [profile.dev]
 opt-level = 1

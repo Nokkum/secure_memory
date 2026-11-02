@@ -1,6 +1,5 @@
 // Secure memory allocation with OS-level memory locking.
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ffi::{c_int, c_void};
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
@@ -30,7 +29,6 @@ const WRITE_WHILE_VIEWED_MSG: &str =
 
 const BUSY_MSG: &str = "secure buffer is being modified; try again";
 
-// SecureMemory
 #[pymodule]
 fn secure_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SecureMemory>()?;
@@ -40,38 +38,28 @@ fn secure_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pyclass]
 pub struct SecureMemory {
-    /// Fixed-size backing store on pages of its own.  It must never be
-    /// resized or moved: exported buffer views hold a raw pointer into it.
     data: PageBuf,
     locked: bool,
-    /// Number of live buffer-protocol exports over `data`.  `write()` is
-    /// refused while this is non-zero, so a live view never observes a
-    /// partially written buffer.
     exports: AtomicUsize,
 }
 
 #[pymethods]
 impl SecureMemory {
-    /// Allocate `size` zero-initialised bytes and attempt to lock them into RAM.
-    ///
-    /// The bytes live on whole pages that belong to this object alone (the
-    /// allocation is rounded up to a multiple of the page size), so locking
-    /// and unlocking never touches memory owned by anything else.  Raises
-    /// `MemoryError` if the allocation fails.
     #[new]
     #[pyo3(signature = (size, *, require_lock = false))]
     fn new(size: usize, require_lock: bool) -> PyResult<Self> {
+        if size == 0 && require_lock {
+            return Err(PyValueError::new_err("cannot lock an empty buffer"));
+        }
         let data = PageBuf::new_zeroed(size).ok_or_else(|| {
             PyMemoryError::new_err(format!("cannot allocate a secure buffer of {size} bytes"))
         })?;
         let (ptr, region_len) = data.region();
         let locked = if region_len == 0 {
-            // Nothing to lock (zero-length buffer), so nothing can leak.
             false
         } else {
             match Self::lock_memory(ptr, region_len) {
                 Ok(()) => true,
-                // `data` was never written to, so dropping it here leaks nothing.
                 Err(e) if require_lock => {
                     return Err(PyOSError::new_err(format!(
                         "could not lock {region_len} bytes of secure memory into RAM: {e}"
@@ -90,24 +78,11 @@ impl SecureMemory {
         })
     }
 
-    // write / read
-
-    /// Copy `data` into the buffer at `offset`.
-    ///
-    /// Raises `BufferError` if any view of the buffer is still alive
-    /// (`memoryview(sm)`, `with_buffer()`, `view()`, or a slice kept from
-    /// one).  Views point straight at the backing store, and a consumer that
-    /// releases the GIL (hashing, socket/file I/O) could otherwise read while
-    /// this copy is in flight and see a torn mix of old and new bytes.
-    /// Release the views first, then write.
     fn write(&mut self, py: Python<'_>, offset: usize, data: PyBuffer<u8>) -> PyResult<()> {
         let dest = self.write_range(offset, data.item_count())?;
         data.copy_to_slice(py, dest)
     }
 
-    /// Copy `length` bytes at `offset` into a Python `bytes` object.
-    ///
-    /// The copy lives outside the zeroize boundary.  Prefer `with_buffer()`.
     fn read<'py>(
         &self,
         py: Python<'py>,
@@ -125,17 +100,10 @@ impl SecureMemory {
         Ok(PyBytes::new(py, &self.data[offset..end]))
     }
 
-    /// Zeroize the buffer in place.  The length is unchanged.
     fn clear(&mut self) {
-        // Zeroize in place; the length must not change, or later writes would
-        // fail and existing buffer views would describe memory the object no
-        // longer reports.
         self.data.as_mut_slice().zeroize();
     }
 
-    /// Returns `True` if the OS memory-locking call succeeded.
-    /// On Windows this calls `VirtualLock`; on Unix, `mlock`.  A zero-length
-    /// buffer has nothing to lock and reports `False`.
     fn is_locked(&self) -> bool {
         self.locked
     }
@@ -144,35 +112,24 @@ impl SecureMemory {
         self.data.len()
     }
 
-    /// Supports the built-in `len(sm)`.
     fn __len__(&self) -> usize {
         self.data.len()
     }
 
-    /// Copy the contents into a Python `bytes` object.
-    ///
-    /// Note: the returned object is an unavoidable copy outside our
-    /// zeroize boundary.  Minimise the lifetime of the returned value, or
-    /// better, use `with_buffer()` / `view()` / `memoryview(sm)`, which do
-    /// not copy.
+    fn __bool__(&self) -> bool {
+        true
+    }
+
     fn as_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.data)
     }
 
-    /// Call `callback(view)` with a read-only `memoryview` over the buffer
-    /// (no copy) and return its result.
-    ///
-    /// The view is always released afterwards, even if the callback raises.
-    /// If the callback kept a derived view alive (e.g. `mv[1:4]`), a
-    /// `BufferError` is raised.  Copying out of the view (`bytes(mv)`) is the
-    /// caller's explicit choice and is not prevented.
     fn with_buffer<'py>(
         slf: &Bound<'py, Self>,
         callback: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let view = Self::memoryview(slf)?;
         let result = callback.call1((&view,));
-        // Release even if the callback failed, so the view cannot be reused.
         let released = view.call_method0("release");
         drop(view);
         let value = result?;
@@ -183,10 +140,6 @@ impl SecureMemory {
         Ok(value)
     }
 
-    /// Return a context manager yielding a read-only `memoryview` over the
-    /// buffer (no copy), used as `with sm.view() as mv: ...`.  The view is
-    /// released on exit, and a `BufferError` is raised if a derived view
-    /// (e.g. a slice) was kept alive past the `with` block.
     fn view(slf: &Bound<'_, Self>) -> SecureView {
         SecureView {
             owner: slf.clone().unbind(),
@@ -194,20 +147,6 @@ impl SecureMemory {
         }
     }
 
-    /// Buffer protocol: expose the buffer read-only, without copying.
-    ///
-    /// The exported view holds a strong reference to this object, so the
-    /// memory cannot be freed (or zeroized by `Drop`) while a view exists.
-    ///
-    /// While any view is alive the contents are stable: `write()` raises
-    /// `BufferError`.  `clear()` is the one exception (see its docs) and is
-    /// visible through live views.
-    ///
-    /// # Safety
-    ///
-    /// Called by CPython with a valid `view` pointer (or null, which is
-    /// rejected).  `data` is never resized, so the exported pointer stays
-    /// valid for as long as the exporter is alive.
     unsafe fn __getbuffer__(
         slf: Bound<'_, Self>,
         view: *mut ffi::Py_buffer,
@@ -223,10 +162,6 @@ impl SecureMemory {
         }
 
         let (buf, len) = {
-            // `try_borrow`, not `borrow`: if `write()`/`clear()` holds the
-            // object right now, fail with a `BufferError` instead of
-            // panicking (cannot happen while the GIL is held; see the
-            // threading note at the top of this file).
             let this = slf
                 .try_borrow()
                 .map_err(|_| PyBufferError::new_err(BUSY_MSG))?;
@@ -262,15 +197,11 @@ impl SecureMemory {
         Ok(())
     }
 
-    /// # Safety
-    ///
-    /// Called by CPython once for every successful `__getbuffer__`.
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
         self.exports.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/// Context manager returned by `SecureMemory.view()`.
 #[pyclass]
 pub struct SecureView {
     owner: Py<SecureMemory>,
@@ -300,7 +231,6 @@ impl SecureView {
             Some(v) => v.bind(py).call_method0("release").map(|_| ()),
             None => Ok(()),
         };
-        // Do not mask an exception that is already propagating.
         if exc_type.is_none() {
             released?;
             if SecureMemory::exports_checked(self.owner.bind(py))? != 0 {
@@ -312,7 +242,6 @@ impl SecureView {
 }
 
 impl SecureMemory {
-    /// Read-only `memoryview` over this object (goes through `__getbuffer__`).
     fn memoryview<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         slf.py()
             .import("builtins")?
@@ -320,13 +249,10 @@ impl SecureMemory {
             .call1((slf,))
     }
 
-    /// Number of live buffer-protocol exports.
     fn exports(&self) -> usize {
         self.exports.load(Ordering::Acquire)
     }
 
-    /// Check that `len` bytes can be written at `offset` and return that part
-    /// of the buffer.  Refuses while any view is alive (see `write()`).
     fn write_range(&mut self, offset: usize, len: usize) -> PyResult<&mut [u8]> {
         if self.exports() != 0 {
             return Err(PyBufferError::new_err(WRITE_WHILE_VIEWED_MSG));
@@ -340,16 +266,12 @@ impl SecureMemory {
         Ok(&mut self.data.as_mut_slice()[offset..end])
     }
 
-    /// Copy a Rust slice into the buffer; the same checks as `write()`.
     #[cfg(test)]
     fn write_slice(&mut self, offset: usize, src: &[u8]) -> PyResult<()> {
         self.write_range(offset, src.len())?.copy_from_slice(src);
         Ok(())
     }
 
-    /// Like `exports()`, but starting from the Python object, and failing with
-    /// a `BufferError` (never a panic) if the object is currently borrowed
-    /// mutably.
     fn exports_checked(slf: &Bound<'_, Self>) -> PyResult<usize> {
         let this = slf
             .try_borrow()
@@ -358,15 +280,10 @@ impl SecureMemory {
     }
 }
 
-// Page-aligned backing store
-
-/// Size of a memory page on the host (queried once).
 fn page_size() -> usize {
     static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
         let size = query_page_size();
-        // `Layout` needs a power-of-two alignment; fall back to the common
-        // page size if the OS reports something odd.
         if size.is_power_of_two() {
             size
         } else {
@@ -377,7 +294,6 @@ fn page_size() -> usize {
 
 #[cfg(unix)]
 fn query_page_size() -> usize {
-    // SAFETY: `sysconf` has no preconditions.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if size > 0 {
         size as usize
@@ -389,7 +305,6 @@ fn query_page_size() -> usize {
 #[cfg(windows)]
 fn query_page_size() -> usize {
     use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-    // SAFETY: `SYSTEM_INFO` is plain old data, and `GetSystemInfo` fills it in.
     let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
     unsafe { GetSystemInfo(&mut info) };
     info.dwPageSize as usize
@@ -400,69 +315,105 @@ fn query_page_size() -> usize {
     4096
 }
 
-/// A fixed-size, zero-initialised byte buffer that starts on a page boundary
-/// and spans a whole number of pages.
-///
-/// `mlock`/`munlock` (and `VirtualLock`/`VirtualUnlock`) work on whole pages,
-/// and page locks do not nest: a plain `Vec<u8>` shares its pages with other
-/// heap data and with other `SecureMemory` buffers, so unlocking one buffer on
-/// drop could silently unlock another one's pages.  Owning the pages outright
-/// avoids that.
-///
-/// The memory is released on drop but not wiped: `SecureMemory`'s own `Drop`
-/// does the zeroize and unlock first.
-struct PageBuf {
-    ptr: NonNull<u8>,
-    /// Usable length requested by the caller.
-    len: usize,
-    /// Layout of the allocation (a multiple of the page size), or `None` for a
-    /// zero-length buffer, which allocates nothing.
-    layout: Option<Layout>,
+#[cfg(unix)]
+fn os_alloc(size: usize) -> *mut u8 {
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        ptr::null_mut()
+    } else {
+        p.cast::<u8>()
+    }
 }
 
-// SAFETY: `PageBuf` uniquely owns its allocation, exactly like `Box<[u8]>`.
+#[cfg(unix)]
+unsafe fn os_free(ptr: *mut u8, size: usize) {
+    libc::munmap(ptr.cast::<libc::c_void>(), size);
+}
+
+#[cfg(windows)]
+fn os_alloc(size: usize) -> *mut u8 {
+    use windows_sys::Win32::System::Memory as winmem;
+    let p = unsafe {
+        winmem::VirtualAlloc(
+            ptr::null_mut(),
+            size,
+            winmem::MEM_COMMIT | winmem::MEM_RESERVE,
+            winmem::PAGE_READWRITE,
+        )
+    };
+    p.cast::<u8>()
+}
+
+#[cfg(windows)]
+unsafe fn os_free(ptr: *mut u8, _size: usize) {
+    use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+    VirtualFree(ptr.cast(), 0, MEM_RELEASE);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_alloc(size: usize) -> *mut u8 {
+    match std::alloc::Layout::from_size_align(size, page_size()) {
+        Ok(layout) => unsafe { std::alloc::alloc_zeroed(layout) },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+unsafe fn os_free(ptr: *mut u8, size: usize) {
+    if let Ok(layout) = std::alloc::Layout::from_size_align(size, page_size()) {
+        std::alloc::dealloc(ptr, layout);
+    }
+}
+
+struct PageBuf {
+    ptr: NonNull<u8>,
+    len: usize,
+    region_len: usize,
+}
+
 unsafe impl Send for PageBuf {}
 unsafe impl Sync for PageBuf {}
 
 impl PageBuf {
-    /// Allocate `len` zeroed bytes, or `None` if the size is unrepresentable
-    /// or the allocator is out of memory.
     fn new_zeroed(len: usize) -> Option<Self> {
         if len == 0 {
             return Some(PageBuf {
                 ptr: NonNull::dangling(),
                 len: 0,
-                layout: None,
+                region_len: 0,
             });
         }
         let page = page_size();
-        // Round up to a whole number of pages (`page` is a power of two).
-        let size = len.checked_add(page - 1)? & !(page - 1);
-        let layout = Layout::from_size_align(size, page).ok()?;
-        // SAFETY: `layout` has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+        let region_len = len.checked_add(page - 1)? & !(page - 1);
+        if region_len > isize::MAX as usize {
+            return None;
+        }
+        let ptr = NonNull::new(os_alloc(region_len))?;
         Some(PageBuf {
             ptr,
             len,
-            layout: Some(layout),
+            region_len,
         })
     }
 
-    /// The whole-page region owned by this buffer, as `(start, byte length)`;
-    /// the length is zero for a zero-length buffer.  This, not `len`, is what
-    /// gets locked and unlocked.
     fn region(&self) -> (*mut u8, usize) {
-        (self.ptr.as_ptr(), self.layout.map_or(0, |l| l.size()))
+        (self.ptr.as_ptr(), self.region_len)
     }
 
     fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` is valid for `len` initialised bytes (or `len == 0`
-        // and `ptr` is a non-null, aligned dangling pointer).
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: as in `as_slice`, and `&mut self` is exclusive.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -483,21 +434,15 @@ impl DerefMut for PageBuf {
 
 impl Drop for PageBuf {
     fn drop(&mut self) {
-        if let Some(layout) = self.layout {
-            // SAFETY: allocated in `new_zeroed` with exactly this layout.
-            unsafe { dealloc(self.ptr.as_ptr(), layout) };
+        if self.region_len != 0 {
+            unsafe { os_free(self.ptr.as_ptr(), self.region_len) };
         }
     }
 }
 
-// Platform-specific locking
 impl SecureMemory {
-    // The `ptr`/`len` arguments below must describe a live, page-aligned
-    // region owned by the caller (see `PageBuf::region`).
-
     #[cfg(unix)]
     fn lock_memory(ptr: *mut u8, len: usize) -> std::io::Result<()> {
-        // SAFETY: see above.
         if unsafe { mlock(ptr as *const libc::c_void, len) } == 0 {
             Ok(())
         } else {
@@ -507,7 +452,6 @@ impl SecureMemory {
 
     #[cfg(unix)]
     fn unlock_memory(ptr: *mut u8, len: usize) {
-        // SAFETY: see above.
         unsafe {
             munlock(ptr as *const libc::c_void, len);
         }
@@ -515,7 +459,6 @@ impl SecureMemory {
 
     #[cfg(windows)]
     fn lock_memory(ptr: *mut u8, len: usize) -> std::io::Result<()> {
-        // SAFETY: see above.
         if unsafe { VirtualLock(ptr as *mut _, len) } != 0 {
             Ok(())
         } else {
@@ -525,7 +468,6 @@ impl SecureMemory {
 
     #[cfg(windows)]
     fn unlock_memory(ptr: *mut u8, len: usize) {
-        // SAFETY: see above.
         unsafe {
             VirtualUnlock(ptr as *mut _, len);
         }
@@ -533,7 +475,6 @@ impl SecureMemory {
 
     #[cfg(not(any(unix, windows)))]
     fn lock_memory(_ptr: *mut u8, _len: usize) -> std::io::Result<()> {
-        // Unsupported platform: heap allocation only.
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "memory locking is not supported on this platform",
@@ -543,19 +484,15 @@ impl SecureMemory {
     #[cfg(not(any(unix, windows)))]
     fn unlock_memory(_ptr: *mut u8, _len: usize) {}
 
-    /// Best effort: keep the region out of core dumps.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn exclude_from_core_dumps(ptr: *mut u8, len: usize) {
-        // SAFETY: see above.  Failure only means the pages stay dumpable.
         unsafe {
             libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP);
         }
     }
 
-    /// Undo `exclude_from_core_dumps` before the region is freed.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn include_in_core_dumps(ptr: *mut u8, len: usize) {
-        // SAFETY: see above.
         unsafe {
             libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DODUMP);
         }
@@ -568,26 +505,18 @@ impl SecureMemory {
     fn include_in_core_dumps(_ptr: *mut u8, _len: usize) {}
 }
 
-// Drop: zeroize then unlock
-
 impl Drop for SecureMemory {
     fn drop(&mut self) {
-        // Zeroize first, then unlock: the pages must never be swappable while
-        // they still hold the secret.
         self.data.as_mut_slice().zeroize();
         let (ptr, len) = self.data.region();
         if len != 0 {
             if self.locked {
                 Self::unlock_memory(ptr, len);
             }
-            // The pages go back to the allocator next, so undo the core-dump
-            // exclusion rather than leave unrelated heap data out of dumps.
             Self::include_in_core_dumps(ptr, len);
         }
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {
@@ -606,6 +535,8 @@ mod tests {
         let mem = SecureMemory::new(32, false).unwrap();
         assert_eq!(mem.len(), 32);
         assert_eq!(mem.__len__(), 32);
+        assert!(mem.__bool__());
+        assert!(SecureMemory::new(0, false).unwrap().__bool__());
     }
 
     #[test]
@@ -619,19 +550,19 @@ mod tests {
     fn test_buffer_starts_on_page_boundary_and_keeps_requested_length() {
         let mut mem = SecureMemory::new(5, false).unwrap();
         assert_eq!(mem.data.as_ptr() as usize % page_size(), 0);
-        // The rounded-up padding is not reachable through the API.
+        let (_, region_len) = mem.data.region();
+        assert!(region_len >= 5);
+        assert_eq!(region_len % page_size(), 0);
         assert_eq!(mem.len(), 5);
         assert!(mem.write_slice(0, b"abcde").is_ok());
         assert!(mem.write_slice(1, b"abcde").is_err());
     }
 
-    /// `VmFlags` line of the `/proc/self/smaps` mapping containing `addr`.
     #[cfg(target_os = "linux")]
     fn vm_flags_of(addr: usize) -> Option<String> {
         let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
         let mut in_mapping = false;
         for line in smaps.lines() {
-            // Mapping header: "start-end perms offset dev inode [path]".
             if let Some((start, rest)) = line.split_once('-') {
                 if let Some((end, _)) = rest.split_once(' ') {
                     if let (Ok(s), Ok(e)) = (
@@ -661,7 +592,6 @@ mod tests {
             eprintln!("skipped: no VmFlags in /proc/self/smaps on this system");
             return;
         };
-        // "dd" = do not include area into core dumps.
         assert!(
             flags.split_whitespace().any(|f| f == "dd"),
             "VmFlags:{flags}"
@@ -669,15 +599,18 @@ mod tests {
     }
 
     #[test]
-    fn test_require_lock_on_empty_buffer_succeeds() {
-        assert!(SecureMemory::new(0, true).is_ok());
+    fn test_require_lock_on_empty_buffer_is_value_error() {
+        Python::attach(|py| {
+            let Err(err) = SecureMemory::new(0, true) else {
+                panic!("an empty buffer cannot satisfy require_lock");
+            };
+            assert!(err.is_instance_of::<PyValueError>(py));
+        });
+        assert!(SecureMemory::new(0, false).is_ok());
     }
 
     #[test]
     fn test_require_lock_agrees_with_is_locked() {
-        // Whether the OS allows locking depends on the environment
-        // (RLIMIT_MEMLOCK, CAP_IPC_LOCK), so accept both outcomes, but they
-        // must be coherent with each other.
         Python::attach(|_py| match SecureMemory::new(64, true) {
             Ok(mem) => assert!(mem.is_locked()),
             Err(_) => assert!(!SecureMemory::new(64, false).unwrap().is_locked()),
@@ -718,20 +651,16 @@ mod tests {
         Python::attach(|py| {
             let obj = Bound::new(py, SecureMemory::new(8, false).unwrap()).unwrap();
 
-            // A mutable source, which the caller can wipe afterwards.
             let src = pyo3::types::PyByteArray::new(py, b"secret!!");
             let buf = PyBuffer::<u8>::get(src.as_any()).unwrap();
             obj.borrow_mut().write(py, 0, buf).unwrap();
             assert_eq!(&obj.borrow().data[..], b"secret!!");
 
-            // `bytes` keeps working.
             let src = PyBytes::new(py, b"abcd");
             let buf = PyBuffer::<u8>::get(src.as_any()).unwrap();
             obj.borrow_mut().write(py, 2, buf).unwrap();
             assert_eq!(&obj.borrow().data[..], b"seabcd!!");
 
-            // Bounds are still enforced on this path, and a failed write
-            // leaves the buffer alone.
             let src = PyBytes::new(py, b"abcd");
             let buf = PyBuffer::<u8>::get(src.as_any()).unwrap();
             let err = obj.borrow_mut().write(py, 6, buf).unwrap_err();
@@ -744,7 +673,7 @@ mod tests {
     fn test_write_bounds() {
         let mut mem = SecureMemory::new(4, false).unwrap();
         assert!(mem.write_slice(0, b"abcd").is_ok());
-        assert!(mem.write_slice(1, b"abcd").is_err()); // would overflow
+        assert!(mem.write_slice(1, b"abcd").is_err());
     }
 
     #[test]
@@ -768,7 +697,6 @@ mod tests {
             assert!(mv.set_item(0, 1).is_err(), "view must be read-only");
             assert_eq!(obj.borrow().exports(), 1);
 
-            // Zero-copy: clear() is visible through the live view.
             obj.borrow_mut().clear();
             assert_eq!(tobytes(&mv).unwrap(), vec![0u8; 8]);
 
@@ -799,7 +727,6 @@ mod tests {
             drop(mv);
             assert_eq!(obj.borrow().exports(), 0);
 
-            // Once the view is gone, writing works again.
             obj.borrow_mut().write_slice(0, b"tampered").unwrap();
             assert_eq!(&obj.borrow().data[..], b"tampered");
         });
@@ -812,7 +739,6 @@ mod tests {
             obj.borrow_mut().write_slice(0, b"abcd").unwrap();
 
             let mv = SecureMemory::memoryview(&obj).unwrap();
-            // A derived view survives `mv.release()`.
             let derived = builtin(py, "memoryview").call1((&mv,)).unwrap();
             mv.call_method0("release").unwrap();
             assert_eq!(obj.borrow().exports(), 1);
@@ -832,7 +758,6 @@ mod tests {
             obj.borrow_mut().write_slice(0, b"abcd").unwrap();
 
             let mv = SecureMemory::memoryview(&obj).unwrap();
-            // A wipe is never blocked by a (possibly leaked) view.
             obj.borrow_mut().clear();
             assert_eq!(tobytes(&mv).unwrap(), vec![0u8; 4]);
 
@@ -846,9 +771,6 @@ mod tests {
     fn test_writable_buffer_request_rejected() {
         Python::attach(|py| {
             let obj = Bound::new(py, SecureMemory::new(4, false).unwrap()).unwrap();
-            // Ask for a writable buffer directly.  Python-level helpers such as
-            // ctypes' from_buffer() request a read-only view and then check
-            // `readonly`, so they raise TypeError instead of reaching this path.
             let mut view = std::mem::MaybeUninit::<ffi::Py_buffer>::uninit();
             let rc = unsafe {
                 ffi::PyObject_GetBuffer(obj.as_ptr(), view.as_mut_ptr(), ffi::PyBUF_WRITABLE)
@@ -866,7 +788,6 @@ mod tests {
             let obj = Bound::new(py, SecureMemory::new(4, false).unwrap()).unwrap();
             obj.borrow_mut().write_slice(0, b"abcd").unwrap();
 
-            // `bytes(mv)` is an explicit, caller-chosen copy.
             let out = SecureMemory::with_buffer(&obj, &builtin(py, "bytes")).unwrap();
             assert_eq!(out.extract::<Vec<u8>>().unwrap(), b"abcd".to_vec());
             assert_eq!(obj.borrow().exports(), 0);
@@ -877,7 +798,6 @@ mod tests {
     fn test_with_buffer_releases_when_callback_raises() {
         Python::attach(|py| {
             let obj = Bound::new(py, SecureMemory::new(4, false).unwrap()).unwrap();
-            // `getattr(memoryview)` raises TypeError: it needs at least two arguments.
             let err = SecureMemory::with_buffer(&obj, &builtin(py, "getattr")).unwrap_err();
             assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
             assert_eq!(obj.borrow().exports(), 0);
@@ -888,10 +808,8 @@ mod tests {
     fn test_with_buffer_detects_retained_view() {
         Python::attach(|py| {
             let obj = Bound::new(py, SecureMemory::new(4, false).unwrap()).unwrap();
-            // `memoryview(mv)` returns a derived view that survives mv.release().
             let err = SecureMemory::with_buffer(&obj, &builtin(py, "memoryview")).unwrap_err();
             assert!(err.is_instance_of::<PyBufferError>(py));
-            // The derived view was dropped with the error path.
             assert_eq!(obj.borrow().exports(), 0);
         });
     }

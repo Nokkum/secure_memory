@@ -8,11 +8,13 @@
 
 - Zeroization on drop.
 - Explicit `clear()` support.
-- Best-effort OS memory locking.
+- Best-effort OS memory locking (strict mode: `require_lock=True`).
+- Core-dump exclusion on Linux/Android (best-effort).
 - Read-only zero-copy `memoryview` access.
 - Scoped access with `with_buffer()` and `view()`.
 - Fixed-size storage to keep exported pointers stable.
 - Bounds checks for reads and writes.
+- Bundled type stubs.
 - Python 3.9+ support.
 - CPython support.
 
@@ -44,7 +46,7 @@ Supported platforms declared by the project:
 If a compatible release is published:
 
 ```bash
-python -m pip install secure_memory
+python -m pip install secure-memory
 ```
 
 Using a virtual environment is recommended:
@@ -56,7 +58,7 @@ python -m venv .venv
 Activate it, then install:
 
 ```bash
-python -m pip install secure_memory
+python -m pip install secure-memory
 ```
 
 ### From source
@@ -101,8 +103,8 @@ You should normally get:
 
 ```text
 dist/
-├── secure_memory-0.2.0-*.whl
-└── secure_memory-0.2.0.tar.gz
+├── secure_memory-*-*.whl
+└── secure_memory-*.tar.gz
 ```
 
 The files are:
@@ -133,7 +135,7 @@ memory.clear()
 
 ## API
 
-### `SecureMemory(size)`
+### `SecureMemory(size, *, require_lock=False)`
 
 Creates a fixed-size, zero-initialized buffer.
 
@@ -141,9 +143,12 @@ Creates a fixed-size, zero-initialized buffer.
 memory = SecureMemory(64)
 ```
 
+- Raises `MemoryError` if allocation fails.
+- With `require_lock=True`, raises `OSError` if the memory can't be locked (`ValueError` for size 0).
+
 ### `write(offset, data)`
 
-Writes bytes into the buffer.
+Writes a byte buffer (`bytes`, `bytearray`, `memoryview` of bytes) into the buffer.
 
 ```python
 memory.write(0, b"secret")
@@ -151,6 +156,8 @@ memory.write(0, b"secret")
 
 - Raises `ValueError` for invalid ranges.
 - Raises `BufferError` while a view is alive.
+- Other item formats (e.g. `array('i')`) are rejected.
+- Prefer a `bytearray` source so you can overwrite it afterwards.
 
 ### `read(offset, length)`
 
@@ -172,7 +179,7 @@ memory.clear()
 
 ### `len()`
 
-Returns the buffer size.
+Returns the buffer size. `len(memory)` also works.
 
 ```python
 size = memory.len()
@@ -252,7 +259,13 @@ Check the result with:
 memory.is_locked()
 ```
 
-Locking is best-effort and may fail because of operating-system limits or permissions.
+Locking is best-effort and may fail because of operating-system limits or permissions. Use `require_lock=True` to raise `OSError` instead.
+
+Buffers use whole pages, so each one counts at least one page against the lock limit.
+
+## Core dumps
+
+On Linux/Android the buffer is excluded from core dumps (best-effort). Not on macOS/Windows.
 
 ## Zeroization
 
@@ -304,6 +317,7 @@ Also avoid:
 
 - Logging secrets.
 - Converting secrets to `str` unnecessarily.
+- Passing secrets to `write()` as immutable `bytes`.
 - Keeping temporary secret objects alive longer than needed.
 - Assuming `is_locked()` is always `True`.
 - Treating memory locking as encryption.
@@ -336,6 +350,14 @@ Run Rust tests:
 
 ```bash
 cargo test
+```
+
+Run Python tests:
+
+```bash
+python -m pip install pytest
+maturin develop
+pytest
 ```
 
 Run formatting checks:

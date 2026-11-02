@@ -4,6 +4,7 @@ Run after building the extension into the active environment, e.g.
 ``maturin develop && pytest``.
 """
 
+import array
 import ctypes
 import hashlib
 import sys
@@ -18,6 +19,11 @@ def test_len_builtin_and_method():
     assert len(sm) == 16 == sm.len()
 
 
+def test_buffer_is_always_truthy():
+    assert SecureMemory(4)
+    assert SecureMemory(0)  # empty, but still a live object
+
+
 def test_write_read_roundtrip():
     sm = SecureMemory(16)
     sm.write(2, b"abc")
@@ -30,6 +36,13 @@ def test_write_accepts_bytes_like_objects(make):
     sm = SecureMemory(8)
     sm.write(0, make(b"secret!!"))
     assert sm.read(0, 8) == b"secret!!"
+
+
+def test_write_rejects_non_byte_buffers():
+    sm = SecureMemory(16)
+    with pytest.raises((TypeError, BufferError)):
+        sm.write(0, array.array("i", [1, 2]))
+    assert sm.read(0, 16) == b"\x00" * 16
 
 
 def test_source_bytearray_can_be_wiped_after_write():
@@ -131,7 +144,11 @@ def test_zero_size_buffer():
     assert len(sm) == 0
     assert not sm.is_locked()
     assert sm.read(0, 0) == b""
-    SecureMemory(0, require_lock=True)  # nothing to lock, so nothing to fail
+
+
+def test_require_lock_rejects_empty_buffer():
+    with pytest.raises(ValueError):
+        SecureMemory(0, require_lock=True)
 
 
 @pytest.mark.skipif(sys.maxsize <= 2**32, reason="needs a 64-bit size_t")

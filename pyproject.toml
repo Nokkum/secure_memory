@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "secure_memory"
-version = "0.3.0"
+version = "0.3.1"
 description = "Locked, zeroize-on-drop memory buffer for Python, backed by a Rust/PyO3 extension"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "Apache-2.0"
@@ -17,8 +17,10 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
+    "Typing :: Typed",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Nokkum/secure_memory"
 Repository = "https://github.com/Nokkum/secure_memory"
+Documentation = "https://github.com/Nokkum/secure_memory/tree/main/docs"
+"Issue Tracker" = "https://github.com/Nokkum/secure_memory/issues"

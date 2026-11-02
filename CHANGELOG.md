@@ -1,5 +1,12 @@
 <h1 align="center"> Changelog </h1>
 
+# v0.3.1
+- **Allocation**: Allocated straight from the OS with `mmap`/`VirtualAlloc`, committed lazily.
+- **`require_lock=True`**: `require_lock=True` with `size == 0` raises `ValueError`, because an empty buffer cannot be locked.
+- **`write()`**: accepts any byte buffer (`bytearray`, a `memoryview` of bytes, `array('B')`), not just `bytes`; other item formats such as `array('i')` are rejected, so a secret can be stored from a buffer the caller then overwrites.
+- **`len(sm)`**: Objects stay truthy even when empty (`__bool__`).
+- **Docs**: added documentation
+
 # v0.3.0
 - **Allocation**: every buffer now sits on whole pages of its own instead of in a `Vec`. `mlock`/`munlock` work per page and do not nest, so dropping one buffer could unlock pages another buffer (or unrelated heap data) shared with it, while `is_locked()` still said `True`. The length you ask for is unchanged. Each buffer now uses at least one page of `RLIMIT_MEMLOCK` (or the Windows working-set quota).
 - **`SecureMemory(size)`**: an impossible or failed allocation raises `MemoryError` instead of aborting the process.
@@ -9,6 +16,12 @@
 - **`len(sm)`** now works (`__len__`); `len()` is kept.
 - **Borrow handling**: `with_buffer()` and `view()` use `try_borrow`, like `__getbuffer__`, so a concurrent borrow is a `BufferError`, never a panic.
 - **Packaging**: added type stubs (`secure_memory.pyi`), a pytest suite. Removed the unused `tempfile` dev-dependency and zeroize's `derive` feature.
+
+# v0.2.2
+- bumped version to update description on PyPI.
+
+# v0.2.1
+- bumped version to update description on PyPI.
 
 # v0.2.0
 - **`write()`**: it now raises `BufferError` while any view is alive, including a slice or copy of a memoryview that was kept. Before, a consumer that releases the GIL could read mid-write and see a torn mix of old and new bytes. The check is race-free because PyO3's borrow flag already keeps `write()` apart from `read()` and from new views.
