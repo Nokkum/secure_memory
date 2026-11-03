@@ -58,4 +58,4 @@ It is a building block for handling secrets carefully, not a sandbox.
 
 ## Reporting an issue
 
-Report suspected vulnerabilities in [issues](https://github.com/Nokkum/secure_memory/issue).
+Report suspected vulnerabilities in [issues](https://github.com/Nokkum/secure_memory/issues).
