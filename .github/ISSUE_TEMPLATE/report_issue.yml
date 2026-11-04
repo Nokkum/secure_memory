@@ -1,0 +1,71 @@
+name: Report an Issue
+description: Report bug(s) found in `secure_memory`.
+labels: ["bugs"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A brief description of the bug(s) you encountered.
+      placeholder: "Example: What the bug is and how it works"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: What is the severity of the bug and how much does this issue affect your ability to use the project?
+      multiple: false
+      options:
+        - Critical
+        - High / Serious
+        - Medium / Moderate
+        - Low / Minor
+        - Trivial
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Is the bug reproducible?
+      placeholder: "The bug produced by doing X with Y." 
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system used
+      placeholder: "macOS 14.5, Windows 11, iOS 17, Android 14, Ubuntu 22.04"
+    validations:
+      required: false
+
+  - type: textarea
+    id: code-sample
+    attributes:
+      label: Code sample or message text (optional)
+      description: Provide the relevant code snippet or the exact text of the message, if possible.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else we should know? Related issues, code samples, or workarounds you've tried.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      description: Your issue will be closed if these requirements are not met.
+      options:
+        - label: I have searched existing issues and confirmed this is not a duplicate.
+          required: true
+        - label: I have written a clear description of the bug and its behaviors.
+          required: true
