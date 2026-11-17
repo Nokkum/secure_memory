@@ -1,7 +1,7 @@
 // Secure memory allocation with OS-level memory locking.
 
 use std::ffi::{c_int, c_void};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -41,6 +41,7 @@ pub struct SecureMemory {
     data: PageBuf,
     locked: bool,
     exports: AtomicUsize,
+    dirty: usize,
 }
 
 #[pymethods]
@@ -61,9 +62,7 @@ impl SecureMemory {
             match Self::lock_memory(ptr, region_len) {
                 Ok(()) => true,
                 Err(e) if require_lock => {
-                    return Err(PyOSError::new_err(format!(
-                        "could not lock {region_len} bytes of secure memory into RAM: {e}"
-                    )));
+                    return Err(Self::lock_error(&e, region_len));
                 }
                 Err(_) => false,
             }
@@ -75,6 +74,7 @@ impl SecureMemory {
             data,
             locked,
             exports: AtomicUsize::new(0),
+            dirty: 0,
         })
     }
 
@@ -101,7 +101,7 @@ impl SecureMemory {
     }
 
     fn clear(&mut self) {
-        self.data.as_mut_slice().zeroize();
+        self.wipe();
     }
 
     fn is_locked(&self) -> bool {
@@ -155,6 +155,9 @@ impl SecureMemory {
         if view.is_null() {
             return Err(PyBufferError::new_err("View is null"));
         }
+        unsafe {
+            (*view).obj = ptr::null_mut();
+        }
         if (flags & ffi::PyBUF_WRITABLE) == ffi::PyBUF_WRITABLE {
             return Err(PyBufferError::new_err(
                 "SecureMemory exposes read-only buffers; use write() to modify it",
@@ -166,7 +169,7 @@ impl SecureMemory {
                 .try_borrow()
                 .map_err(|_| PyBufferError::new_err(BUSY_MSG))?;
             this.exports.fetch_add(1, Ordering::AcqRel);
-            (this.data.as_ptr() as *mut c_void, this.data.len())
+            (this.data.region().0.cast::<c_void>(), this.data.len())
         };
 
         unsafe {
@@ -263,7 +266,14 @@ impl SecureMemory {
         if end > self.data.len() {
             return Err(PyValueError::new_err("Write would exceed buffer size"));
         }
+        self.dirty = self.dirty.max(end);
         Ok(&mut self.data.as_mut_slice()[offset..end])
+    }
+
+    fn wipe(&mut self) {
+        let dirty = self.dirty;
+        self.data.as_mut_slice()[..dirty].zeroize();
+        self.dirty = 0;
     }
 
     #[cfg(test)]
@@ -426,12 +436,6 @@ impl Deref for PageBuf {
     }
 }
 
-impl DerefMut for PageBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
-    }
-}
-
 impl Drop for PageBuf {
     fn drop(&mut self) {
         if self.region_len != 0 {
@@ -441,6 +445,22 @@ impl Drop for PageBuf {
 }
 
 impl SecureMemory {
+    #[cfg(unix)]
+    fn lock_error(e: &std::io::Error, region_len: usize) -> PyErr {
+        let message = format!("could not lock {region_len} bytes of secure memory into RAM: {e}");
+        match e.raw_os_error() {
+            Some(code) => PyOSError::new_err((code, message)),
+            None => PyOSError::new_err(message),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn lock_error(e: &std::io::Error, region_len: usize) -> PyErr {
+        PyOSError::new_err(format!(
+            "could not lock {region_len} bytes of secure memory into RAM: {e}"
+        ))
+    }
+
     #[cfg(unix)]
     fn lock_memory(ptr: *mut u8, len: usize) -> std::io::Result<()> {
         if unsafe { mlock(ptr as *const libc::c_void, len) } == 0 {
@@ -507,7 +527,7 @@ impl SecureMemory {
 
 impl Drop for SecureMemory {
     fn drop(&mut self) {
-        self.data.as_mut_slice().zeroize();
+        self.wipe();
         let (ptr, len) = self.data.region();
         if len != 0 {
             if self.locked {
@@ -611,9 +631,21 @@ mod tests {
 
     #[test]
     fn test_require_lock_agrees_with_is_locked() {
-        Python::attach(|_py| match SecureMemory::new(64, true) {
+        Python::attach(|py| match SecureMemory::new(64, true) {
             Ok(mem) => assert!(mem.is_locked()),
-            Err(_) => assert!(!SecureMemory::new(64, false).unwrap().is_locked()),
+            Err(err) => assert!(err.is_instance_of::<PyOSError>(py)),
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_lock_error_carries_errno() {
+        Python::attach(|py| {
+            let io_err = std::io::Error::from_raw_os_error(libc::ENOMEM);
+            let err = SecureMemory::lock_error(&io_err, 4096);
+            assert!(err.is_instance_of::<PyOSError>(py));
+            let errno: i32 = err.value(py).getattr("errno").unwrap().extract().unwrap();
+            assert_eq!(errno, libc::ENOMEM);
         });
     }
 
@@ -644,6 +676,48 @@ mod tests {
         assert_eq!(mem.len(), 8);
         assert!(mem.write_slice(0, b"new data").is_ok());
         assert_eq!(&mem.data[..], b"new data");
+    }
+
+    #[test]
+    fn test_dirty_tracks_highest_byte_written() {
+        let mut mem = SecureMemory::new(64, false).unwrap();
+        assert_eq!(mem.dirty, 0);
+        mem.write_slice(10, b"abc").unwrap();
+        assert_eq!(mem.dirty, 13);
+        mem.write_slice(0, b"z").unwrap();
+        assert_eq!(mem.dirty, 13);
+        mem.write_slice(60, b"wxyz").unwrap();
+        assert_eq!(mem.dirty, 64);
+        mem.clear();
+        assert_eq!(mem.dirty, 0);
+    }
+
+    #[test]
+    fn test_refused_writes_leave_dirty_untouched() {
+        let mut mem = SecureMemory::new(8, false).unwrap();
+        mem.write_slice(0, b"abcd").unwrap();
+        assert!(mem.write_slice(6, b"xyz").is_err());
+        assert_eq!(mem.dirty, 4);
+        Python::attach(|py| {
+            let obj = Bound::new(py, mem).unwrap();
+            let mv = SecureMemory::memoryview(&obj).unwrap();
+            assert!(obj.borrow_mut().write_slice(0, b"abcdefgh").is_err());
+            assert_eq!(obj.borrow().dirty, 4);
+            mv.call_method0("release").unwrap();
+            drop(mv);
+            assert_eq!(obj.borrow().exports(), 0);
+        });
+    }
+
+    #[test]
+    fn test_clear_wipes_everything_written_across_pages() {
+        let page = page_size();
+        let mut mem = SecureMemory::new(page * 3, false).unwrap();
+        mem.write_slice(page * 3 - 2, b"hi").unwrap();
+        mem.write_slice(page + 1, b"mid").unwrap();
+        mem.clear();
+        assert_eq!(mem.data.len(), page * 3);
+        assert!(mem.data.iter().all(|&b| b == 0));
     }
 
     #[test]

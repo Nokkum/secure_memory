@@ -77,7 +77,7 @@ Each entry records what was decided, why, and what it costs.
 ## 13. GIL-based threading model with defensive `try_borrow`
 
 **Decision.** The module does not opt in to free-threaded Python. Where a borrow could fail, `try_borrow` returns `BufferError` rather than panicking.
-**Why.** The GIL is what keeps `write()`/`clear()` apart from new exports; the design has not been analysed for free-threaded execution. Panics must not cross the FFI boundary.
+**Why.** The GIL is what keeps `write()`/`clear()` apart from new exports; the design has not been analysed for free-threaded execution. `__releasebuffer__` also needs a shared borrow of the object to keep `exports` correct: under the GIL no `&mut self` method can be running when a view is released, but on a free-threaded interpreter `clear()` could be, and the decrement would be lost. Panics must not cross the FFI boundary.
 **Cost.** A free-threaded interpreter re-enables the GIL for this module.
 
 ## 14. Core-dump exclusion on Linux and Android only, best-effort
@@ -89,4 +89,16 @@ Each entry records what was decided, why, and what it costs.
 ## 15. Error vocabulary
 
 **Decision.** `MemoryError` for allocation, `OSError` for a refused lock in strict mode, `ValueError` for bad arguments and bounds, `BufferError` for view conflicts and writable-buffer requests.
-**Why.** Each maps to the Python exception that already means that kind of failure, so callers can handle them without library-specific types.
+**Why.** Each maps to the Python exception that already means that kind of failure, so callers can handle them without library-specific types. On Unix the `OSError` for a refused lock is built from the OS error code, so `errno` is set and callers can branch on it; on Windows only the message is set.
+
+## 16. Wipe only the bytes that were written
+
+**Decision.** `SecureMemory` records the end of the furthest range `write()` has handed out (`dirty`). `clear()` and `Drop` zeroize `[0, dirty)`, and `clear()` resets `dirty` to 0. `PageBuf` implements no `DerefMut`, so `write()` is the only way bytes can become non-zero.
+**Why.** Pages come from the OS zero-filled and committed lazily (decision 4). Wiping all `len` bytes touched every page, so clearing or dropping a large, never-filled buffer whose lock had failed committed all of it, which could exhaust memory. Bytes above the mark are known to be zero, so skipping them changes nothing observable. `dirty` is raised before the copy, so a write that fails part-way is still wiped.
+**Cost.** One more field, and an invariant (architecture, invariant 7) that every future write path must preserve.
+
+## 17. No comments in `src/lib.rs`
+
+**Decision.** `src/lib.rs` carries no comments except its header line, and no doc comments.
+**Why.** Doc comments on `#[pyclass]` and `#[pymethods]` items become runtime docstrings, which would then have to stay in sync with the stub and these documents. Explanations live in `docs/`, and each `unsafe` block's invariant is listed in [Architecture](architecture.md#where-unsafe-is-used).
+**Cost.** A reader of the source has to open the documents to learn why something is the way it is.

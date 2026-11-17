@@ -49,6 +49,10 @@ These exercise the real Python surface: `len()`/`bool()`, keyword-only `require_
 
 Behaviour that depends on the OS (whether locking is permitted) is tested for coherence between `require_lock` and `is_locked()` rather than for a fixed outcome.
 
+## Release workflow
+
+`.github/workflows/release.yml` runs after the `Secure Memory CI` workflow completes and publishes only when that run was a successful `push` to `main` of this repository (`workflow_run.event == 'push'` and the head repository equal to this repository). A `pull_request` run never releases, including one from a fork whose branch happens to be named `main`: the release job has write and PyPI trusted-publishing permissions, and such a run builds artifacts from code nobody has reviewed. A release is created when the version in `Cargo.toml` has no matching tag yet.
+
 ## Lint and format
 
 ```bash

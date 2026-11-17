@@ -1,12 +1,12 @@
 # Contributing to `secure_memory`
 
-Contributions to this project are released to the public under the [project's open source license](LICENSE) (Apache License 2.0).
+Contributions to this project are released to the public under the [project's license](LICENSE).
 
 By participating in this project you agree to abide by its terms whether  you want to submit a bug report, give suggestions or help with development, all we ask is that you follow the guidelines below.
 
 # Code of Conduct
 
-You can read our Code of Conduct [here](CODE_OF_CONDUCT.md)
+You can read our [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## Reporting Problems
 

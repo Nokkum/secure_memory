@@ -17,7 +17,7 @@ It is a building block for handling secrets carefully, not a sandbox.
 
 ## Guarantees (when the preconditions hold)
 
-1. **Zeroized on drop.** The `len` bytes are overwritten with zeros before the pages are unlocked and unmapped, even if the object is dropped by the interpreter during an exception.
+1. **Zeroized on drop.** Every byte that was written is overwritten with zeros (bytes never written are still zero from allocation) before the pages are unlocked and unmapped, even if the object is dropped by the interpreter during an exception.
 2. **Not swapped**, provided locking succeeded. With `require_lock=True` you know it did; otherwise check `is_locked()`.
 3. **Not in Linux or Android core dumps**, unless `madvise` failed (the result is ignored).
 4. **Memory isolation from other allocations.** The secret shares no page with unrelated heap data, so neither locking nor core-dump exclusion touches other memory and no other allocation can be placed beside it on a page.
@@ -58,4 +58,4 @@ It is a building block for handling secrets carefully, not a sandbox.
 
 ## Reporting an issue
 
-Report suspected vulnerabilities in [issues](https://github.com/Nokkum/secure_memory/issues).
+Report suspected vulnerabilities in [issues](https://github.com/Nokkum/secure_memory/issues/new).

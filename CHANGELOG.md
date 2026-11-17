@@ -1,5 +1,12 @@
 <h1 align="center"> Changelog </h1>
 
+# v0.3.2
+- **Zeroization**: `clear()` and drop wipe only the bytes that were written, tracked by a high-water mark, instead of every byte. A large buffer that was never filled is no longer committed to memory just to be wiped. See [Memory Protection](docs/memory-protection.md).
+- **Buffer protocol**: the exported pointer is the allocation's own pointer rather than one derived from a shared slice, and a failed `__getbuffer__` leaves `view->obj` NULL as CPython expects.
+- **`require_lock=True`**: on Unix the `OSError` carries the OS `errno`.
+- **Internals**: `PageBuf` no longer implements `DerefMut`, so `write()` is the only path that can make bytes non-zero.
+- **Tests**: `test_require_lock_agrees_with_is_locked` no longer depends on what other tests have locked; added tests for the high-water mark and the `errno`.
+
 # v0.3.1
 - **Allocation**: Allocated straight from the OS with `mmap`/`VirtualAlloc`, committed lazily.
 - **`require_lock=True`**: `require_lock=True` with `size == 0` raises `ValueError`, because an empty buffer cannot be locked.

@@ -27,7 +27,7 @@ Raises:
 | Exception | When |
 |---|---|
 | `MemoryError` | The allocation fails or the size cannot be represented. |
-| `OSError` | `require_lock=True` and the OS refused to lock the memory. The message includes the OS error. |
+| `OSError` | `require_lock=True` and the OS refused to lock the memory. The message includes the OS error, and on Unix the exception's `errno` is set to it. |
 | `ValueError` | `require_lock=True` with `size == 0` (an empty buffer cannot be locked). |
 | `TypeError` | `require_lock` passed positionally, or `size` not an integer. |
 | `OverflowError` | `size` is negative or too large for the platform's `usize`. |
@@ -71,7 +71,7 @@ Returns a copy of the entire buffer as `bytes`. Same caveat as `read`.
 
 ## `clear()`
 
-Overwrites the whole buffer with zeros in place. The length is unchanged and the buffer stays usable.
+Overwrites the whole buffer with zeros in place. In practice only the bytes written since the last `clear()` are touched; every other byte is still zero from allocation, so the result is the same and pages that were never written are not committed. The length is unchanged and the buffer stays usable.
 
 `clear()` is never refused because of live views: a wipe must always succeed. The wipe is visible through any live view, which can at worst observe a partially wiped buffer, never new or inconsistent plaintext.
 
@@ -130,7 +130,7 @@ The export is read-only, one-dimensional, `itemsize` 1, and reports format `B` w
 | Exception | Raised by | Message or meaning |
 |---|---|---|
 | `MemoryError` | `SecureMemory()` | `cannot allocate a secure buffer of N bytes` |
-| `OSError` | `SecureMemory(require_lock=True)` | `could not lock N bytes of secure memory into RAM: <os error>` |
+| `OSError` | `SecureMemory(require_lock=True)` | `could not lock N bytes of secure memory into RAM: <os error>` (on Unix `errno` is set, so `str(e)` starts with `[Errno N]`) |
 | `ValueError` | `SecureMemory(0, require_lock=True)` | `cannot lock an empty buffer` |
 | `ValueError` | `write` | `Offset overflow`, `Write would exceed buffer size` |
 | `ValueError` | `read` | `Offset overflow`, `Read would exceed buffer size` |

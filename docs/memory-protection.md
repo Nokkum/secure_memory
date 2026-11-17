@@ -53,7 +53,7 @@ For a non-empty buffer, the whole region is locked right after allocation: `mloc
 | Mode | On lock failure |
 |---|---|
 | default | The buffer is created anyway; `is_locked()` returns `False`. |
-| `require_lock=True` | `OSError` is raised, with the OS error in the message. Nothing was written, so the freshly mapped pages are simply unmapped. |
+| `require_lock=True` | `OSError` is raised, with the OS error in the message (and, on Unix, in `errno`). Nothing was written, so the freshly mapped pages are simply unmapped. |
 
 `require_lock=True` with `size == 0` raises `ValueError`: an empty buffer has nothing to lock, and returning it would break the "never unlocked" promise.
 
@@ -82,12 +82,14 @@ On Linux and Android, after locking, `madvise(region, MADV_DONTDUMP)` marks the 
 
 ## Zeroization
 
-The `len` bytes of the buffer are overwritten with zeros, using the `zeroize` crate (volatile writes that the optimiser may not remove), in two places:
+The bytes of the buffer that were ever written are overwritten with zeros, using the `zeroize` crate (volatile writes that the optimiser may not remove), in two places:
 
 - `clear()`, on demand, in place; the length is unchanged;
 - `Drop`, always, before unlocking and unmapping.
 
-Page padding beyond `len` is never written, so it is still zero from the allocation and needs no wipe.
+The buffer keeps a high-water mark: the end of the furthest range `write()` has handed out. `clear()` and `Drop` wipe from offset 0 up to that mark, and `clear()` then resets it. Everything above the mark has never been written, so it is still zero from the allocation and needs no wipe. This matters when locking failed (or was not required) and a very large buffer was never filled: its pages are committed lazily, and writing zeros over all of them in `clear()` or on drop would commit every page just to wipe nothing.
+
+Page padding beyond `len` is never written either, for the same reason.
 
 What is outside the zeroize boundary: any copy made from the buffer (`read()`, `as_bytes()`, `bytes(mv)`), the source object you passed to `write()`, and anything a consumer of a view copies internally.
 

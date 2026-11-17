@@ -37,6 +37,8 @@ A view points directly at the memory. A consumer running on another thread may h
 
 A wipe must always succeed. If a leaked view could block `clear()`, and the same leaked view keeps the object (and its `Drop`) alive, the secret would become impossible to erase. `clear()` only ever writes zeros, so a reader racing with it can at worst see a partially wiped buffer, never new or inconsistent plaintext.
 
+Strictly speaking this is a data race on plain bytes with a reader that has released the GIL (for example `hashlib` on a large buffer). The memory stays mapped, because the view holds a reference to the object, so the only observable effect is the reader seeing zeros appear part-way through. The library accepts that trade-off and does not make `clear()` wait for readers.
+
 ## Scoped access
 
 Two helpers make the lifetime of a view explicit.

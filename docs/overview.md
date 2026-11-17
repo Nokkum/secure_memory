@@ -60,4 +60,4 @@ sm.clear()                                 # zeroize now; also happens on drop
 | Windows | `VirtualAlloc` | `VirtualLock` | not applied |
 | Anything else | `std::alloc` fallback | reports "unsupported" | not applied |
 
-Python 3.9 or newer; Rust 1.83 or newer (the minimum required by PyO3 0.29, which the crate builds against). Details are in [Memory Protection ](memory-protection.md).
+Python 3.9 or newer; Rust 1.83 or newer (the minimum required by PyO3 0.29, which the crate builds against). Details are in [Memory Protection](memory-protection.md).
